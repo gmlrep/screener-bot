@@ -56,6 +56,11 @@ class BinanceSettings(BaseModel):
     ws_pool_size: int = int(os.getenv("BINANCE_WS_POOL_SIZE", "5"))
     ws_reconnect_delay_ms: int = int(os.getenv("BINANCE_WS_RECONNECT_DELAY_MS", "5000"))
 
+    # Фильтры списка символов: 24h quote volume (USDT) и минимальная история по onboardDate.
+    # 0 отключает соответствующий фильтр.
+    min_quote_volume: float = float(os.getenv("BINANCE_MIN_QUOTE_VOLUME", "5000000"))
+    min_history_days: int = int(os.getenv("BINANCE_MIN_HISTORY_DAYS", "180"))
+
     alert_window_size: str = os.getenv("BINANCE_ALERT_WINDOW_SIZE", "15m")
     alert_cache_ttl_seconds: int = int(os.getenv("BINANCE_ALERT_CACHE_TTL_SECONDS", str(15 * 60 + 60)))
     alert_subscriptions_refresh_seconds: int = int(os.getenv("BINANCE_ALERT_SUBSCRIPTIONS_REFRESH_SECONDS", "15"))

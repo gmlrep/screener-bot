@@ -14,14 +14,17 @@ admin_router = Router()
 @admin_router.message(Command("upd_symbols"))
 async def update_symbols_handler(message: Message):
     screener = BinanceScreener()
-    await screener.update_symbols_list()
+    saved, skipped_volume, skipped_history = await screener.update_symbols_list()
 
     # P7: не ждём 300 секунд до фонового refresh, просим движок обновиться сразу.
     engine = get_binance_kline_alert_engine()
     if engine is not None:
         engine.request_symbols_reload()
 
-    await message.answer('Символы обновлены')
+    await message.answer(
+        f"Символы обновлены: сохранено {saved}, "
+        f"отфильтровано по объёму — {skipped_volume}, по истории — {skipped_history}"
+    )
 
 
 @admin_router.message(Command("ws_stats"))
