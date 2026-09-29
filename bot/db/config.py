@@ -65,6 +65,8 @@ class BinanceSettings(BaseModel):
     alert_subscriptions_refresh_seconds: int = int(os.getenv("BINANCE_ALERT_SUBSCRIPTIONS_REFRESH_SECONDS", "15"))
     alert_symbols_refresh_seconds: int = int(os.getenv("BINANCE_ALERT_SYMBOLS_REFRESH_SECONDS", "300"))
     alert_reconnect_delay_seconds: int = int(os.getenv("BINANCE_ALERT_RECONNECT_DELAY_SECONDS", "5"))
+    # Максимальное время на create_connection(); SDK без таймаута может висеть ~5 минут.
+    alert_ws_connect_timeout_seconds: int = int(os.getenv("BINANCE_ALERT_WS_CONNECT_TIMEOUT_SECONDS", "20"))
     # SDK сам не реконнектит на CLOSE/ERROR, поэтому health-check не должен ждать окно свечи.
     alert_ws_idle_timeout_seconds: int = int(os.getenv("BINANCE_ALERT_WS_IDLE_TIMEOUT_SECONDS", "120"))
     alert_subscribe_delay_seconds: float = float(os.getenv("BINANCE_ALERT_SUBSCRIBE_DELAY_SECONDS", "0.0"))

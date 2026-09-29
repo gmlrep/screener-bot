@@ -60,6 +60,8 @@ class BinanceKlineAlertEngine:
         self.subscriptions_refresh_seconds = settings.binance.alert_subscriptions_refresh_seconds
         self.symbols_refresh_seconds = settings.binance.alert_symbols_refresh_seconds
         self.reconnect_delay_seconds = settings.binance.alert_reconnect_delay_seconds
+        # SDK без таймаута может висеть ~5 минут на create_connection().
+        self.connect_timeout_seconds = max(5, settings.binance.alert_ws_connect_timeout_seconds)
         self.subscribe_delay_seconds = settings.binance.alert_subscribe_delay_seconds
         self.subscribe_chunk_size = max(1, settings.binance.alert_subscribe_chunk_size)
 
@@ -243,6 +245,9 @@ class BinanceKlineAlertEngine:
         """
         if not symbols:
             return set()
+
+        if ws_streams is None:
+            raise RuntimeError("no websocket streams to subscribe on")
 
         connections = [
             connection
@@ -442,12 +447,30 @@ class BinanceKlineAlertEngine:
             "last_error": self._last_error,
         }
 
+    def _connection_unusable(self) -> bool:
+        return bool(self.symbol_titles) and not self._symbol_stream_handles
+
+    async def _reset_client(self) -> None:
+        """Сбрасывает соединения/сессию SDK после неудачного connect, чтобы не копить мусор."""
+        try:
+            await self.client_ws.websocket_streams.close_connection(close_session=True)
+        except Exception as e:  # noqa: BLE001
+            loguru.logger.debug(f"close_connection failed: {e}")
+
     async def _connect_ws(self) -> object | None:
         """Устанавливает соединение и подписывается на все символы. None, если остановлено."""
         while not self._stop_event.is_set():
             try:
-                ws_streams = await self.client_ws.websocket_streams.create_connection()
+                ws_streams = await asyncio.wait_for(
+                    self.client_ws.websocket_streams.create_connection(),
+                    timeout=self.connect_timeout_seconds,
+                )
+                if ws_streams is None:
+                    # SDK ловит ошибку внутри connect() и возвращает None вместо исключения.
+                    raise RuntimeError("create_connection() returned None (connect failed)")
                 self._failed_symbols = await self._sync_symbol_streams(ws_streams)
+                if self._connection_unusable():
+                    raise RuntimeError("no symbol streams subscribed, connection unusable")
                 self._last_message_monotonic = time.monotonic()
                 return ws_streams
             except Exception as e:  # noqa: BLE001 - цикл реконнекта
@@ -455,6 +478,7 @@ class BinanceKlineAlertEngine:
                 self._last_error = str(e)
                 loguru.logger.warning(f"WS connect/retry error: {e}")
                 await self._drop_all_streams()
+                await self._reset_client()
                 await asyncio.sleep(self.reconnect_delay_seconds)
         return None
 
@@ -522,11 +546,14 @@ class BinanceKlineAlertEngine:
             if symbols_changed and ws_streams is not None:
                 try:
                     self._failed_symbols = await self._sync_symbol_streams(ws_streams)
+                    if self._connection_unusable():
+                        raise RuntimeError("no symbol streams subscribed, connection unusable")
                 except Exception as e:  # noqa: BLE001
                     self._resubscribe_retries += 1
                     self._last_error = str(e)
                     loguru.logger.warning(f"WS resubscribe failed, reconnecting: {e}")
                     await self._drop_all_streams()
+                    await self._reset_client()
                     ws_streams = await self._connect_ws()
                     if ws_streams is None:
                         return
@@ -537,11 +564,14 @@ class BinanceKlineAlertEngine:
             if self._failed_symbols and ws_streams is not None and now >= self._failed_retry_at:
                 try:
                     self._failed_symbols = await self._sync_symbol_streams(ws_streams)
+                    if self._connection_unusable():
+                        raise RuntimeError("no symbol streams subscribed, connection unusable")
                 except Exception as e:  # noqa: BLE001
                     self._resubscribe_retries += 1
                     self._last_error = str(e)
                     loguru.logger.warning(f"WS failed-symbols retry error, reconnecting: {e}")
                     await self._drop_all_streams()
+                    await self._reset_client()
                     ws_streams = await self._connect_ws()
                     if ws_streams is None:
                         return
