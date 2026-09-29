@@ -1,6 +1,6 @@
 from aiogram import Router
-from aiogram.types import Message
 from aiogram.filters import Command
+from aiogram.types import Message
 
 from bot.screeners.binance import BinanceScreener
 from bot.screeners.binance_ws_alerts import get_binance_kline_alert_engine_stats

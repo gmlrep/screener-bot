@@ -35,15 +35,16 @@ class LRUCache:
         return expire_at is not None and self._now() >= expire_at
 
     def _purge_expired(self) -> None:
-        """Удаляет все просроченные элементы (проход слева направо)."""
-        keys_to_remove = []
-        for k, (_v, expire_at) in self._cache.items():
-            if self._is_expired(expire_at):
-                keys_to_remove.append(k)
-            else:
-                # OrderedDict упорядочен по использованию; как только встречается не просроченный,
-                # следующие могут быть новее, но они могут также быть просрочены — продолжаем.
-                continue
+        """Удаляет все просроченные элементы.
+
+        Вызывается только при подсчёте длины (не на каждый set), чтобы не сканировать
+        весь кэш на каждую свечу.
+        """
+        now = self._now()
+        keys_to_remove = [
+            k for k, (_v, expire_at) in self._cache.items()
+            if expire_at is not None and now >= expire_at
+        ]
         for k in keys_to_remove:
             self._cache.pop(k, None)
 
@@ -68,7 +69,7 @@ class LRUCache:
     def set(self,
             key: Any,
             value: Any,
-            ttl: float | int | None = None
+            ttl: float | None = None
             ) -> None:
         """
         Устанавливает ключ со значением и ttl (в секундах). ttl=None — бессрочно.
@@ -81,12 +82,13 @@ class LRUCache:
             self._cache.pop(key)
         self._cache[key] = (value, expire_at)
 
-        # Сначала почистить просроченные
-        self._purge_expired()
-
-        # Удалить самые старые пока превышаем capacity
+        # Удаляем элементы, пока превышаем capacity. Просроченные вытесняем в первую очередь.
         while len(self._cache) > self.capacity:
-            self._cache.popitem(last=False)  # удаляет LRU (слева)
+            first_key, (_first_value, first_expire_at) = next(iter(self._cache.items()))
+            if self._is_expired(first_expire_at):
+                self._cache.pop(first_key, None)
+            else:
+                self._cache.popitem(last=False)  # удаляет LRU (слева)
 
     def remove(self,
                key: Any

@@ -1,4 +1,5 @@
-from sqlalchemy import not_, select, update
+from sqlalchemy import func, not_, select
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError
 
 from bot.db.database import async_session
@@ -12,9 +13,7 @@ class UserService:
         super().__init__()
         self.user_repo = CRUD(model=User)
 
-    async def add_user(self,
-                       **data
-                       ) -> bool:
+    async def add_user(self, **data) -> bool:
         try:
             await self.user_repo.create(data=data)
             return True
@@ -30,38 +29,50 @@ class UserService:
         if not user:
             return False
 
-        user = dict(user)
-        return user.get(alert_field)
+        return bool(user.get(alert_field))
 
     async def find_users_with_alert(self,
                                     alert_field: str = 'alert_20m',
                                     ) -> list[int]:
         users = await self.user_repo.read(filter_by={alert_field: True})
-        user_ids = [u.get('user_id') for u in users]
-        return user_ids
+        return [u.get('user_id') for u in users]
 
     async def update_alert(self,
                            filter_by: dict,
                            alert_field: str = 'alert_20m',
                            ) -> None:
+        column = User.__table__.c.get(alert_field)
+        if column is None:
+            return
         await self.user_repo.update(filter_by=filter_by,
-                                    values={alert_field: not_(User.__table__.c.get(alert_field))})
+                                    values={alert_field: not_(column)})
 
     async def count_users(self) -> int:
         async with async_session() as session:
-            response = await session.execute(select(User.username))
-            count = len(response.scalars().all())
-            return count
-    
-    async def insert_user(self, user_id: int, username: str, fullname: str) -> None:
+            response = await session.execute(select(func.count()).select_from(User))
+            return int(response.scalar_one())
+
+    async def insert_user(self,
+                          user_id: int,
+                          username: str | None,
+                          fullname: str,
+                          ) -> None:
+        """
+        Идемпотентный upsert пользователя по user_id в рамках одной сессии.
+        Раньше username мог быть None и нарушал NOT NULL/UNIQUE.
+        """
         async with async_session() as session:
-            resp = await session.execute(select(User.user_id).filter_by(user_id=user_id))
-            resp = resp.scalar()
-            if resp is None:
-                await self.user_repo.create(data={
-                    'user_id': user_id,
+            stmt = sqlite_insert(User).values(
+                user_id=user_id,
+                username=username,
+                user_fullname=fullname,
+            )
+            stmt = stmt.on_conflict_do_update(
+                index_elements=['user_id'],
+                set_={
                     'username': username,
                     'user_fullname': fullname,
-                })
-            else:
-                await self.user_repo.update(filter_by={'user_id': user_id}, values={'username': username})
+                },
+            )
+            await session.execute(stmt)
+            await session.commit()

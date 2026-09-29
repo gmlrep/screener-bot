@@ -1,17 +1,6 @@
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 
-# Пример клавиатуры
-def kb_alert(is_on: bool = False):
-    menu = InlineKeyboardBuilder()
-
-    status = '✅' if is_on else '❌'
-
-    menu.button(text=f"{status} Оповещение", callback_data='alert')
-    menu.adjust(1, 1)
-    return menu.as_markup()
-
-
 def kb_user_settings():
     menu = InlineKeyboardBuilder()
     menu.button(text="⚙️ Настройки", callback_data="user_settings")
@@ -39,5 +28,5 @@ def kb_user_alerts(subscriptions: list[dict]):
     if not subscriptions:
         menu.button(text="➕ Добавить подписку", callback_data="add_alert_subscription")
 
-    menu.adjust(1, 1)
+    menu.adjust(1)
     return menu.as_markup()

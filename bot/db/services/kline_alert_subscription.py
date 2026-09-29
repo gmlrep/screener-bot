@@ -1,5 +1,6 @@
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
+from bot.db.database import async_session
 from bot.db.models import BinanceKlineAlertSubscription
 from bot.db.services.crud import CRUD
 
@@ -15,37 +16,34 @@ class KlineAlertSubscriptionService:
                                   diff_percent: float,
                                   window_size: str,
                                   ) -> None:
-        existing = await self.repo.find_one(
-            filter_by={'user_id': user_id, 'window_size': window_size}
-        )
-
-        if existing:
-            await self.repo.update(
-                filter_by={'user_id': user_id, 'window_size': window_size},
-                values={'diff_percent': diff_percent, 'active': True},
+        """
+        Атомарный upsert по (user_id, window_size) без гонки read-then-write.
+        """
+        async with async_session() as session:
+            stmt = sqlite_insert(BinanceKlineAlertSubscription).values(
+                user_id=user_id,
+                diff_percent=diff_percent,
+                window_size=window_size,
+                active=True,
             )
-            return
-
-        try:
-            await self.repo.create(
-                data={
-                    'user_id': user_id,
-                    'diff_percent': diff_percent,
-                    'window_size': window_size,
-                    'active': True,
-                }
+            stmt = stmt.on_conflict_do_update(
+                index_elements=['user_id', 'window_size'],
+                set_={'diff_percent': diff_percent, 'active': True},
             )
-        except IntegrityError:
-            await self.repo.update(
-                filter_by={'user_id': user_id, 'window_size': window_size},
-                values={'diff_percent': diff_percent, 'active': True},
-            )
+            await session.execute(stmt)
+            await session.commit()
 
     async def remove_user_subscriptions(self,
                                         *,
                                         user_id: int,
                                         ) -> None:
         await self.repo.delete(filter_by={'user_id': user_id})
+
+    async def deactivate_user_subscriptions(self,
+                                            *,
+                                            user_id: int,
+                                            ) -> None:
+        await self.repo.update(filter_by={'user_id': user_id}, values={'active': False})
 
     async def get_all_subscriptions(self) -> list[dict]:
         return await self.repo.read(filter_by={})

@@ -1,6 +1,6 @@
 import datetime
 
-from sqlalchemy import Integer, String, BigInteger, Float, func, UniqueConstraint
+from sqlalchemy import BigInteger, Float, Integer, String, UniqueConstraint, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from bot.db.database import Base
@@ -11,7 +11,8 @@ class User(Base):
 
     id: Mapped[int] = mapped_column(Integer, autoincrement=True, primary_key=True)
     user_id: Mapped[int] = mapped_column(BigInteger, unique=True)
-    username: Mapped[str] = mapped_column(unique=True)
+    # У части пользователей Telegram username отсутствует, поэтому колонка nullable.
+    username: Mapped[str | None] = mapped_column(unique=True, nullable=True)
     user_fullname: Mapped[str] = mapped_column()
     create_at: Mapped[datetime.datetime] = mapped_column(server_default=func.now())
 

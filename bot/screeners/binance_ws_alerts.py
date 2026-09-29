@@ -1,10 +1,13 @@
 import asyncio
+import time
 from dataclasses import dataclass
+from html import escape
 
 import loguru
 from aiogram import Bot
-from binance_common.constants import WebsocketMode
+from aiogram.exceptions import TelegramForbiddenError
 from binance_common.configuration import ConfigurationWebSocketStreams
+from binance_common.constants import WebsocketMode
 from binance_sdk_derivatives_trading_usds_futures import DerivativesTradingUsdsFutures
 
 from bot.db.config import settings
@@ -23,6 +26,19 @@ WINDOW_SIZE = settings.binance.alert_window_size
 _ENGINE_INSTANCE: "BinanceKlineAlertEngine | None" = None
 
 
+def _window_to_seconds(window: str) -> int:
+    """'15m' -> 900, '1h' -> 3600 и т.п."""
+    if not window:
+        return 60
+    unit = window[-1].lower()
+    try:
+        amount = int(window[:-1])
+    except ValueError:
+        return 60
+    multipliers = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+    return amount * multipliers.get(unit, 60)
+
+
 class BinanceKlineAlertEngine:
     def __init__(
         self,
@@ -34,6 +50,17 @@ class BinanceKlineAlertEngine:
         self.reconnect_delay_seconds = settings.binance.alert_reconnect_delay_seconds
         self.subscribe_delay_seconds = settings.binance.alert_subscribe_delay_seconds
         self._subscribe_call_semaphore = asyncio.Semaphore(settings.binance.alert_subscribe_concurrency)
+
+        # WS считаем "мёртвым", если давно не было сообщений. Порог не меньше окна свечи.
+        self.ws_idle_timeout_seconds = max(
+            settings.binance.alert_ws_idle_timeout_seconds,
+            _window_to_seconds(WINDOW_SIZE) + 60,
+        )
+        # TTL dedupe-ключа должен перекрывать длину свечи, иначе возможны дубли.
+        self._notified_ttl_seconds = max(
+            settings.binance.alert_cache_ttl_seconds,
+            _window_to_seconds(WINDOW_SIZE) + 120,
+        )
 
         # Распределяем подписки по нескольким ws-соединениям, чтобы не убить один transport
         conf_ws = ConfigurationWebSocketStreams(
@@ -55,7 +82,7 @@ class BinanceKlineAlertEngine:
         # symbol -> RequestStreamHandle (нужно, чтобы можно было отписаться при изменении списка символов)
         self._symbol_stream_handles: dict[str, object] = {}
 
-        # (symbol, window_size, candle_close_time) -> True
+        # (symbol, window_size, candle_open_time) -> True
         self._notified_cache = LRUCache(capacity=20000)
 
         # ограничитель одновременных send_message (Telegram rate limit)
@@ -69,6 +96,7 @@ class BinanceKlineAlertEngine:
 
         self._stop_event = asyncio.Event()
         self._started = False
+        self._last_message_monotonic = time.monotonic()
 
         # Runtime metrics for admin diagnostics
         self._connect_retries = 0
@@ -80,9 +108,9 @@ class BinanceKlineAlertEngine:
 
     async def stop(self) -> None:
         self._stop_event.set()
-        # ручная отмена subscribe не нужна: stop_event завершит main loop
         for worker in self._kline_workers:
             worker.cancel()
+        self._kline_workers.clear()
 
     async def _kline_worker(self) -> None:
         while not self._stop_event.is_set():
@@ -94,7 +122,7 @@ class BinanceKlineAlertEngine:
                     self._kline_queue.task_done()
             except asyncio.CancelledError:
                 raise
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 - воркер не должен падать от одной ошибки
                 self._worker_errors += 1
                 self._last_error = str(e)
                 loguru.logger.error(f"kline worker error: {e}")
@@ -151,6 +179,7 @@ class BinanceKlineAlertEngine:
                 await asyncio.sleep(self.subscribe_delay_seconds)
 
         def _on_message(data) -> None:
+            self._last_message_monotonic = time.monotonic()
             # SDK может присылать dict или pydantic-модель.
             payload = self._normalize_payload(data)
             if payload is None:
@@ -168,7 +197,7 @@ class BinanceKlineAlertEngine:
                     _ = self._kline_queue.get_nowait()
                     self._kline_queue.task_done()
                     self._kline_queue.put_nowait(payload)
-                except asyncio.QueueEmpty:
+                except (asyncio.QueueEmpty, asyncio.QueueFull):
                     pass
 
         stream_handle.on("message", _on_message)
@@ -196,6 +225,16 @@ class BinanceKlineAlertEngine:
             return None
         return payload
 
+    async def _drop_all_streams(self) -> None:
+        """Отписываемся от всех стримов перед reconnect, чтобы не копить мёртвые подписки."""
+        handles = list(self._symbol_stream_handles.values())
+        self._symbol_stream_handles.clear()
+        for handle in handles:
+            try:
+                await handle.unsubscribe()
+            except Exception as e:  # noqa: BLE001 - unsubscribe на мёртвом сокете не критичен
+                loguru.logger.debug(f"unsubscribe failed: {e}")
+
     async def _sync_symbol_streams(self, ws_streams: object) -> None:
         """
         Приводим набор подписок к набору символов в `self.symbol_titles`.
@@ -213,23 +252,25 @@ class BinanceKlineAlertEngine:
                 continue
             try:
                 await handle.unsubscribe()
-            except Exception:
-                # если unsubscribe не сработал из-за reconnect'а, это не критично
-                pass
+            except Exception as e:  # noqa: BLE001 - reconnect мог уже убить сокет
+                loguru.logger.debug(f"unsubscribe failed symbol={symbol}: {e}")
 
-        # Subscribe добавленных
+        # Subscribe добавленных. Ошибки собираем, но обрабатываем все символы,
+        # и только потом сигналим наверх для reconnect.
         added_sorted = sorted(added)
         if added_sorted:
             tasks = [self._subscribe_symbol(ws_streams, symbol=s) for s in added_sorted]
             results = await asyncio.gather(*tasks, return_exceptions=True)
+            first_error: Exception | None = None
             for symbol, res in zip(added_sorted, results, strict=False):
                 if isinstance(res, Exception):
                     self._subscribe_errors += 1
                     self._last_error = str(res)
                     loguru.logger.warning(f"subscribe failed symbol={symbol}: {res}")
-                    # транспорт/transport может умереть во время массового subscribe:
-                    # делаем reconnect на уровне main loop
-                    raise res
+                    if first_error is None:
+                        first_error = res
+            if first_error is not None:
+                raise first_error
 
     async def _handle_kline_message(self, *, data: dict, window_size: str) -> None:
         """
@@ -290,17 +331,15 @@ class BinanceKlineAlertEngine:
                 return
 
             # помечаем как уведомленное до отправки, чтобы избежать дублей при ределивери
-            self._notified_cache.set(dedupe_key, True, ttl=settings.binance.alert_cache_ttl_seconds)
+            self._notified_cache.set(dedupe_key, True, ttl=self._notified_ttl_seconds)
 
-            cex = "🟧 Binance"
-            cex_text = "Binance"
-            title = self.symbol_titles.get(symbol, symbol)
+            title = escape(self.symbol_titles.get(symbol, symbol), quote=False)
             status = "🟢 Pump" if change_pct >= 0 else "🔴 Dump"
 
             msg_text = (
-                f"[{cex}](https://www.binance.com/ru/futures/{symbol}) - {window_size} - "
-                f"[{title}](https://www.coinglass.com/tv/{cex_text}_{symbol})\n"
-                f"{status}: {change_pct:.2f}% ({open_price} - {last_price})"
+                f'<a href="https://www.binance.com/ru/futures/{symbol}">🟧 Binance</a> - {window_size} - '
+                f'<a href="https://www.coinglass.com/tv/Binance_{symbol}">{title}</a>\n'
+                f'{status}: {change_pct:.2f}% ({open_price:.8g} - {last_price:.8g})'
             )
 
             async def _send_one(chat_id: int) -> None:
@@ -309,14 +348,27 @@ class BinanceKlineAlertEngine:
                         text=msg_text,
                         chat_id=chat_id,
                         disable_web_page_preview=True,
-                        parse_mode="Markdown",
+                        parse_mode="HTML",
                     )
 
-            await asyncio.gather(*(_send_one(uid) for uid in set(users_to_notify)))
-            loguru.logger.info(
-                f"Alert sent: symbol={symbol} change={change_pct:.2f}% users={len(set(users_to_notify))}"
+            user_ids = sorted(set(users_to_notify))
+            results = await asyncio.gather(
+                *(_send_one(uid) for uid in user_ids),
+                return_exceptions=True,
             )
-        except Exception as e:
+            for uid, res in zip(user_ids, results, strict=False):
+                if isinstance(res, TelegramForbiddenError):
+                    # Пользователь заблокировал бота — отключаем подписку, чтобы не долбиться.
+                    await KlineAlertSubscriptionService().deactivate_user_subscriptions(user_id=uid)
+                    loguru.logger.info(f"User {uid} blocked the bot, subscriptions disabled")
+                elif isinstance(res, Exception):
+                    self._last_error = str(res)
+                    loguru.logger.warning(f"send failed user={uid}: {res}")
+
+            loguru.logger.info(
+                f"Alert sent: symbol={symbol} change={change_pct:.2f}% users={len(user_ids)}"
+            )
+        except Exception as e:  # noqa: BLE001 - обработчик не должен ронять воркер
             self._handle_errors += 1
             self._last_error = str(e)
             loguru.logger.error(f"handle_kline_message error: {e}")
@@ -343,6 +395,22 @@ class BinanceKlineAlertEngine:
             "last_error": self._last_error,
         }
 
+    async def _connect_ws(self) -> object | None:
+        """Устанавливает соединение и подписывается на все символы. None, если остановлено."""
+        while not self._stop_event.is_set():
+            try:
+                ws_streams = await self.client_ws.websocket_streams.create_connection()
+                await self._sync_symbol_streams(ws_streams)
+                self._last_message_monotonic = time.monotonic()
+                return ws_streams
+            except Exception as e:  # noqa: BLE001 - цикл реконнекта
+                self._connect_retries += 1
+                self._last_error = str(e)
+                loguru.logger.warning(f"WS connect/retry error: {e}")
+                await self._drop_all_streams()
+                await asyncio.sleep(self.reconnect_delay_seconds)
+        return None
+
     async def run_forever(self) -> None:
         self._started = True
         if not self._kline_workers:
@@ -354,66 +422,65 @@ class BinanceKlineAlertEngine:
         # initial load (символы + пороги)
         try:
             await self._reload_symbols()
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             loguru.logger.error(f"Initial symbols load error: {e}")
         try:
             await self._reload_subscriptions()
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             loguru.logger.error(f"Initial subscriptions load error: {e}")
 
-        ws_streams = None
-        while not self._stop_event.is_set():
-            try:
-                # create_connection() делается ОДИН раз, чтобы не плодить лишние сокеты
-                ws_streams = await self.client_ws.websocket_streams.create_connection()
-                await self._sync_symbol_streams(ws_streams)
-                break
-            except Exception as e:
-                self._connect_retries += 1
-                self._last_error = str(e)
-                loguru.logger.warning(f"WS connect/retry error: {e}")
-                self._symbol_stream_handles.clear()
-                await asyncio.sleep(self.reconnect_delay_seconds)
+        # create_connection() делается ОДИН раз, чтобы не плодить лишние сокеты
+        ws_streams = await self._connect_ws()
+        if ws_streams is None:
+            return
 
-        last_symbols_reload = asyncio.get_running_loop().time()
-        last_subs_reload = asyncio.get_running_loop().time()
+        loop = asyncio.get_running_loop()
+        last_symbols_reload = loop.time()
+        last_subs_reload = loop.time()
 
         while not self._stop_event.is_set():
-            now = asyncio.get_running_loop().time()
+            now = loop.time()
+
+            # Health check: если по WS давно ничего не приходило — переподключаемся.
+            if self.symbol_titles and now - self._last_message_monotonic > self.ws_idle_timeout_seconds:
+                loguru.logger.warning("WS stream looks idle, reconnecting")
+                await self._drop_all_streams()
+                ws_streams = await self._connect_ws()
+                if ws_streams is None:
+                    return
+                last_symbols_reload = loop.time()
+                last_subs_reload = last_symbols_reload
+                continue
 
             symbols_changed = False
-            subs_changed = False
 
             if now - last_symbols_reload >= self.symbols_refresh_seconds:
                 try:
                     symbols_changed = await self._reload_symbols()
-                except Exception as e:
+                except Exception as e:  # noqa: BLE001
                     loguru.logger.error(f"Symbols reload error: {e}")
                 last_symbols_reload = now
 
             if now - last_subs_reload >= self.subscriptions_refresh_seconds:
                 try:
-                    subs_changed = await self._reload_subscriptions()
-                except Exception as e:
+                    await self._reload_subscriptions()
+                except Exception as e:  # noqa: BLE001
                     loguru.logger.error(f"Subscriptions reload error: {e}")
                 last_subs_reload = now
 
-            if symbols_changed:
-                if ws_streams is not None:
-                    try:
-                        await self._sync_symbol_streams(ws_streams)
-                    except Exception:
-                        # транспорт/transport may die during resubscribe: reconnect and retry
-                        try:
-                            self._symbol_stream_handles.clear()
-                            ws_streams = await self.client_ws.websocket_streams.create_connection()
-                            await self._sync_symbol_streams(ws_streams)
-                        except Exception as e:
-                            self._resubscribe_retries += 1
-                            self._last_error = str(e)
-                            loguru.logger.warning(f"WS resubscribe retry failed: {e}")
-
             # subs_changed ни на какие websocket-подписки не влияет: diff_percent обновляется в памяти
+            if symbols_changed and ws_streams is not None:
+                try:
+                    await self._sync_symbol_streams(ws_streams)
+                except Exception as e:  # noqa: BLE001
+                    self._resubscribe_retries += 1
+                    self._last_error = str(e)
+                    loguru.logger.warning(f"WS resubscribe failed, reconnecting: {e}")
+                    await self._drop_all_streams()
+                    ws_streams = await self._connect_ws()
+                    if ws_streams is None:
+                        return
+
             await asyncio.sleep(1)
 
 

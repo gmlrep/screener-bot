@@ -1,62 +1,86 @@
 import os
-
 from pathlib import Path
 
 from dotenv import load_dotenv
+from pydantic import BaseModel, ConfigDict, field_validator
 from pydantic_settings import BaseSettings
-from pydantic import BaseModel
 
-BASE_DIR = Path(__file__).parent
+BASE_DIR = Path(__file__).resolve().parent  # bot/db
+PROJECT_ROOT = BASE_DIR.parents[1]  # repo root
 
+# Сначала ищем .env в корне проекта, затем — стандартный поиск вверх по дереву.
+load_dotenv(PROJECT_ROOT / ".env")
 load_dotenv()
 
 
+def _parse_int_list(raw: str | None) -> list[int]:
+    if not raw:
+        return []
+
+    result: list[int] = []
+    for chunk in raw.split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        result.append(int(chunk))
+    return result
+
+
 class BotSettings(BaseModel):
-    token: str = os.getenv('BOT_TOKEN')
-    admin_list: list[int] = [int(admin) for admin in os.getenv('ADMIN_LIST_ID').split(',')]
-    language: str = os.getenv('LANGUAGE')
-    throttling: int = int(os.getenv('THROTTLING'))
+    model_config = ConfigDict(validate_default=True)
+
+    token: str = os.getenv("BOT_TOKEN", "")
+    admin_list: list[int] = _parse_int_list(os.getenv("ADMIN_LIST_ID"))
+    language: str = os.getenv("LANGUAGE") or "ru"
+    throttling: int = int(os.getenv("THROTTLING") or 1)
 
     alert_diff: float = 6.0
-    alert_window_size: str = '20m'
+    alert_window_size: str = "20m"
 
-    proxy_url: str = os.getenv('PROXY_URL')
+    proxy_url: str | None = os.getenv("PROXY_URL") or None
+
+    @field_validator("token")
+    @classmethod
+    def _validate_token(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("BOT_TOKEN is not set (check your .env)")
+        return value
 
 
 class BinanceSettings(BaseModel):
-    api_key: str = os.getenv('BINANCE_API_KEY')
-    api_secret: str = os.getenv('BINANCE_API_SECRET')
+    api_key: str | None = os.getenv("BINANCE_API_KEY") or None
+    api_secret: str | None = os.getenv("BINANCE_API_SECRET") or None
 
-    ws_stream_url: str = os.getenv('BINANCE_WS_STREAM_URL', 'wss://fstream.binance.com/stream')
-    ws_pool_size: int = int(os.getenv('BINANCE_WS_POOL_SIZE', '5'))
-    ws_reconnect_delay_ms: int = int(os.getenv('BINANCE_WS_RECONNECT_DELAY_MS', '5000'))
+    ws_stream_url: str = os.getenv("BINANCE_WS_STREAM_URL", "wss://fstream.binance.com/stream")
+    ws_pool_size: int = int(os.getenv("BINANCE_WS_POOL_SIZE", "5"))
+    ws_reconnect_delay_ms: int = int(os.getenv("BINANCE_WS_RECONNECT_DELAY_MS", "5000"))
 
-    alert_window_size: str = os.getenv('BINANCE_ALERT_WINDOW_SIZE', '15m')
-    alert_cache_ttl_seconds: int = int(os.getenv('BINANCE_ALERT_CACHE_TTL_SECONDS', str(15 * 60 + 60)))
-    alert_subscriptions_refresh_seconds: int = int(os.getenv('BINANCE_ALERT_SUBSCRIPTIONS_REFRESH_SECONDS', '15'))
-    alert_symbols_refresh_seconds: int = int(os.getenv('BINANCE_ALERT_SYMBOLS_REFRESH_SECONDS', '300'))
-    alert_reconnect_delay_seconds: int = int(os.getenv('BINANCE_ALERT_RECONNECT_DELAY_SECONDS', '5'))
-    alert_subscribe_delay_seconds: float = float(os.getenv('BINANCE_ALERT_SUBSCRIBE_DELAY_SECONDS', '0.0'))
-    alert_subscribe_concurrency: int = int(os.getenv('BINANCE_ALERT_SUBSCRIBE_CONCURRENCY', '8'))
-    alert_queue_maxsize: int = int(os.getenv('BINANCE_ALERT_QUEUE_MAXSIZE', '5000'))
-    alert_workers_count: int = int(os.getenv('BINANCE_ALERT_WORKERS_COUNT', '4'))
-    alert_send_concurrency: int = int(os.getenv('BINANCE_ALERT_SEND_CONCURRENCY', '8'))
+    alert_window_size: str = os.getenv("BINANCE_ALERT_WINDOW_SIZE", "15m")
+    alert_cache_ttl_seconds: int = int(os.getenv("BINANCE_ALERT_CACHE_TTL_SECONDS", str(15 * 60 + 60)))
+    alert_subscriptions_refresh_seconds: int = int(os.getenv("BINANCE_ALERT_SUBSCRIPTIONS_REFRESH_SECONDS", "15"))
+    alert_symbols_refresh_seconds: int = int(os.getenv("BINANCE_ALERT_SYMBOLS_REFRESH_SECONDS", "300"))
+    alert_reconnect_delay_seconds: int = int(os.getenv("BINANCE_ALERT_RECONNECT_DELAY_SECONDS", "5"))
+    alert_ws_idle_timeout_seconds: int = int(os.getenv("BINANCE_ALERT_WS_IDLE_TIMEOUT_SECONDS", "180"))
+    alert_subscribe_delay_seconds: float = float(os.getenv("BINANCE_ALERT_SUBSCRIBE_DELAY_SECONDS", "0.0"))
+    alert_subscribe_concurrency: int = int(os.getenv("BINANCE_ALERT_SUBSCRIBE_CONCURRENCY", "8"))
+    alert_queue_maxsize: int = int(os.getenv("BINANCE_ALERT_QUEUE_MAXSIZE", "5000"))
+    alert_workers_count: int = int(os.getenv("BINANCE_ALERT_WORKERS_COUNT", "4"))
+    alert_send_concurrency: int = int(os.getenv("BINANCE_ALERT_SEND_CONCURRENCY", "8"))
 
 
-class BbSettings(BaseModel):
+class DbSettings(BaseModel):
+    echo: bool = False
+    path: Path = Path(os.getenv("DB_PATH") or (BASE_DIR / "database.db")).expanduser()
 
     @property
     def db_url(self) -> str:
-        return f"sqlite+aiosqlite:///{BASE_DIR}/database.db"
-
-    echo: bool = False
+        return f"sqlite+aiosqlite:///{self.path}"
 
 
 class Settings(BaseSettings):
     bot: BotSettings = BotSettings()
-    bd: BbSettings = BbSettings()
+    db: DbSettings = DbSettings()
     binance: BinanceSettings = BinanceSettings()
-
 
 
 settings = Settings()

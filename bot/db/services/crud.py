@@ -1,4 +1,4 @@
-from sqlalchemy import select, update, delete, insert, inspect
+from sqlalchemy import delete, insert, inspect, select, update
 
 from bot.db.database import async_session
 

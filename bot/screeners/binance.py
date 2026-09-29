@@ -1,3 +1,5 @@
+import asyncio
+
 from binance_common.configuration import ConfigurationRestAPI
 from binance_sdk_derivatives_trading_usds_futures import DerivativesTradingUsdsFutures
 
@@ -11,24 +13,24 @@ class BinanceScreener:
 
     client = DerivativesTradingUsdsFutures(config_rest_api=conf)
 
-    def _get_symbols(self):
-        response = self.client.rest_api.exchange_information()
+    async def _get_symbols(self) -> dict:
+        # SDK-клиент синхронный, поэтому REST-запрос уводим из event loop в executor.
+        loop = asyncio.get_running_loop()
+        response = await loop.run_in_executor(
+            None,
+            self.client.rest_api.exchange_information,
+        )
         data = response.data()
 
         symbols_data = {}
-
-        symbols = data.symbols
-        for symbol in symbols:
-            data = {
-                f'{symbol.symbol}': {
-                    'title': symbol.base_asset,
-                    'symbol': symbol.symbol,
-                }
+        for symbol in data.symbols:
+            symbols_data[symbol.symbol] = {
+                'title': symbol.base_asset,
+                'symbol': symbol.symbol,
             }
-            symbols_data.update(data)
         return symbols_data
 
     async def update_symbols_list(self) -> None:
-        data = self._get_symbols()
-        servive = BinanceMarginSymbolsService()
-        await servive.create_binance_margin_symbols(data=data)
+        symbols_data = await self._get_symbols()
+        service = BinanceMarginSymbolsService()
+        await service.sync_binance_margin_symbols(data=symbols_data)
