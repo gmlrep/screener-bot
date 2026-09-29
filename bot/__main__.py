@@ -20,9 +20,7 @@ async def main() -> None:
         format="%(asctime)s - %(message)s",
     )
 
-    # В aiogram 3 прокси задаётся через сессию, а не параметром Bot(proxy=...).
-    session = AiohttpSession(proxy=settings.bot.proxy_url) if settings.bot.proxy_url else None
-    bot = Bot(token=settings.bot.token, session=session)
+    bot = Bot(token=settings.bot.token, proxy=settings.bot.proxy_url)
 
     dp = Dispatcher(storage=MemoryStorage())
 
