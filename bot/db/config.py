@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+from urllib.parse import parse_qs, quote, urlparse, urlunparse
 
 from dotenv import load_dotenv
 from pydantic import BaseModel, ConfigDict, field_validator
@@ -26,6 +27,67 @@ def _parse_int_list(raw: str | None) -> list[int]:
     return result
 
 
+# aiohttp-socks (используется aiogram) понимает только http/socks4/socks5.
+_SUPPORTED_PROXY_SCHEMES = {"http", "socks4", "socks5"}
+_TG_PROXY_PREFIXES = ("tg://proxy", "https://t.me/proxy", "http://t.me/proxy", "t.me/proxy")
+_TG_SOCKS_PREFIXES = ("tg://socks", "https://t.me/socks", "http://t.me/socks", "t.me/socks")
+
+
+def normalize_proxy_url(raw: str | None) -> str | None:
+    """Приводит PROXY_URL к формату, который понимает aiohttp-socks.
+
+    - t.me/proxy (MTProto) -> понятная ошибка (для Bot API не подходит);
+    - t.me/socks -> socks5://host:port;
+    - https:// -> http:// (провайдеры обычно так называют обычный CONNECT-прокси);
+    - socks5h:// -> socks5://.
+    """
+    if not raw or not raw.strip():
+        return None
+
+    value = raw.strip()
+    lowered = value.lower()
+
+    if lowered.startswith(_TG_PROXY_PREFIXES):
+        raise ValueError(
+            "PROXY_URL задан ссылкой MTProto-прокси Telegram (t.me/proxy). "
+            "Bot API работает по HTTPS, а MTProto-прокси для HTTP-клиента не подходит. "
+            "Укажите обычный HTTP/SOCKS5-прокси, например: "
+            "socks5://user:pass@host:1080 или http://user:pass@host:8080"
+        )
+
+    if lowered.startswith(_TG_SOCKS_PREFIXES):
+        parsed = urlparse(value if "://" in value else f"https://{value}")
+        query = parse_qs(parsed.query)
+        server = (query.get("server") or [""])[0]
+        port = (query.get("port") or ["1080"])[0]
+        if not server:
+            raise ValueError("PROXY_URL: в ссылке t.me/socks не указан параметр server")
+        user = (query.get("user") or [""])[0]
+        password = (query.get("pass") or [""])[0]
+        auth = f"{quote(user)}:{quote(password)}@" if user else ""
+        return f"socks5://{auth}{server}:{port}"
+
+    if "://" not in value:
+        value = f"http://{value}"
+
+    parsed = urlparse(value)
+    scheme = parsed.scheme.lower()
+    if scheme == "https":
+        scheme = "http"
+    elif scheme == "socks5h":
+        scheme = "socks5"
+
+    if scheme not in _SUPPORTED_PROXY_SCHEMES:
+        supported = ", ".join(sorted(_SUPPORTED_PROXY_SCHEMES))
+        raise ValueError(
+            f"PROXY_URL: схема '{parsed.scheme}' не поддерживается. Доступные схемы: {supported}"
+        )
+    if not parsed.hostname:
+        raise ValueError("PROXY_URL: не удалось определить host прокси")
+
+    return urlunparse(parsed._replace(scheme=scheme))
+
+
 class BotSettings(BaseModel):
     model_config = ConfigDict(validate_default=True)
 
@@ -46,6 +108,11 @@ class BotSettings(BaseModel):
             raise ValueError("BOT_TOKEN is not set (check your .env)")
         return value
 
+    @field_validator("proxy_url")
+    @classmethod
+    def _validate_proxy_url(cls, value: str | None) -> str | None:
+        return normalize_proxy_url(value)
+
 
 class BinanceSettings(BaseModel):
     api_key: str | None = os.getenv("BINANCE_API_KEY") or None
@@ -60,9 +127,12 @@ class BinanceSettings(BaseModel):
     alert_subscriptions_refresh_seconds: int = int(os.getenv("BINANCE_ALERT_SUBSCRIPTIONS_REFRESH_SECONDS", "15"))
     alert_symbols_refresh_seconds: int = int(os.getenv("BINANCE_ALERT_SYMBOLS_REFRESH_SECONDS", "300"))
     alert_reconnect_delay_seconds: int = int(os.getenv("BINANCE_ALERT_RECONNECT_DELAY_SECONDS", "5"))
-    alert_ws_idle_timeout_seconds: int = int(os.getenv("BINANCE_ALERT_WS_IDLE_TIMEOUT_SECONDS", "180"))
+    # SDK сам не реконнектит на CLOSE/ERROR, поэтому health-check не должен ждать окно свечи.
+    alert_ws_idle_timeout_seconds: int = int(os.getenv("BINANCE_ALERT_WS_IDLE_TIMEOUT_SECONDS", "120"))
     alert_subscribe_delay_seconds: float = float(os.getenv("BINANCE_ALERT_SUBSCRIBE_DELAY_SECONDS", "0.0"))
     alert_subscribe_concurrency: int = int(os.getenv("BINANCE_ALERT_SUBSCRIBE_CONCURRENCY", "8"))
+    # Сколько стримов кладём в одну SUBSCRIBE-рамку (Binance допускает до 1024 на соединение).
+    alert_subscribe_chunk_size: int = int(os.getenv("BINANCE_ALERT_SUBSCRIBE_CHUNK_SIZE", "100"))
     alert_queue_maxsize: int = int(os.getenv("BINANCE_ALERT_QUEUE_MAXSIZE", "5000"))
     alert_workers_count: int = int(os.getenv("BINANCE_ALERT_WORKERS_COUNT", "4"))
     alert_send_concurrency: int = int(os.getenv("BINANCE_ALERT_SEND_CONCURRENCY", "8"))

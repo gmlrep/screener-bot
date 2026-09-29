@@ -3,7 +3,6 @@ import logging
 from contextlib import suppress
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.fsm.storage.memory import MemoryStorage
 
 from bot.db.config import settings

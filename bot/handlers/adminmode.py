@@ -3,7 +3,10 @@ from aiogram.filters import Command
 from aiogram.types import Message
 
 from bot.screeners.binance import BinanceScreener
-from bot.screeners.binance_ws_alerts import get_binance_kline_alert_engine_stats
+from bot.screeners.binance_ws_alerts import (
+    get_binance_kline_alert_engine,
+    get_binance_kline_alert_engine_stats,
+)
 
 admin_router = Router()
 
@@ -12,6 +15,12 @@ admin_router = Router()
 async def update_symbols_handler(message: Message):
     screener = BinanceScreener()
     await screener.update_symbols_list()
+
+    # P7: не ждём 300 секунд до фонового refresh, просим движок обновиться сразу.
+    engine = get_binance_kline_alert_engine()
+    if engine is not None:
+        engine.request_symbols_reload()
+
     await message.answer('Символы обновлены')
 
 
@@ -25,6 +34,8 @@ async def ws_stats_handler(message: Message):
         f"ws_connections: {stats.get('ws_connections')}\n"
         f"ws_reconnect_tasks: {stats.get('ws_reconnect_tasks')}\n"
         f"token_streams_active: {stats.get('token_streams_active')}\n"
+        f"failed_symbols: {stats.get('failed_symbols')}\n"
+        f"subscribe_chunk_size: {stats.get('subscribe_chunk_size')}\n"
         f"symbols_loaded: {stats.get('symbols_loaded')}\n"
         f"active_user_subscriptions: {stats.get('active_user_subscriptions')}\n"
         f"queue_size: {stats.get('queue_size')}\n"

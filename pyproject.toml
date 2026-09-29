@@ -7,6 +7,8 @@ requires-python = ">=3.12"
 dependencies = [
     "aiogram>=3.26",
     "aiohttp>=3.13.3",
+    "aiohttp-socks>=0.10",
+    "python-socks[asyncio]>=2.6",
     "aiosqlite~=0.20.0",
     "alembic~=1.13.1",
     "binance-sdk-derivatives-trading-usds-futures>=9.0.0",
